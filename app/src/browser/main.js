@@ -68,7 +68,7 @@ const declareOptions = argv => {
   const optimist = require('optimist');
   const options = optimist(argv);
   options.usage(
-    `Mailspring\n\nUsage: mailspring [options]\n\nRun Mailspring: The open source extensible email client\n\n\`mailspring --dev\` to start the client in dev mode.\n\n\`mailspring --test\` to run unit tests.`
+    `Mailspring\n\nUsage: mailspring [options] [recipient] [attachment]\n\nRun Mailspring: The open source extensible email client\n\n\`mailspring mailto:johndoe@example.com\` to compose an e-mail to johndoe@example.com.\n\`mailspring ./attachment.txt\` to compose an e-mail with a text file attached.\n\`mailspring --dev\` to start the client in dev mode.\n\`mailspring --test\` to run unit tests.`
   );
   options
     .alias('d', 'dev')
@@ -144,8 +144,9 @@ const parseCommandLine = argv => {
   const specFilePattern = args['spec-file-pattern'];
   const showSpecsInWindow = specMode === 'window';
   const resourcePath = path.normalize(path.resolve(path.dirname(path.dirname(__dirname))));
-  const urlsToOpen = [];
-  const pathsToOpen = [];
+  let urlsToOpen = [];
+  let pathsToOpen = [];
+  let mailtoLink;
 
   // On Windows and Linux, mailto and file opens are passed in argv. Go through
   // the items and pluck out things that look like mailto:, mailspring:, file paths
@@ -165,9 +166,20 @@ const parseCommandLine = argv => {
       continue;
     }
     if (arg.startsWith('mailto:') || arg.startsWith('mailspring:')) {
-      urlsToOpen.push(arg);
+      // Handle nautilus-sendto links correctly
+      mailtoLink = extractMailtoLink(arg);
+      urlsToOpen = urlsToOpen.concat(mailtoLink.urlsToOpen);
+      pathsToOpen = pathsToOpen.concat(mailtoLink.pathsToOpen);
     } else if (arg[0] !== '-' && /[/|\\]/.test(arg)) {
-      pathsToOpen.push(arg);
+      if (arg.startsWith('?')) {
+        // Handle thunar-sendto links correctly by giving them a similar form
+        // as the nautilus-sendto links by adding a leading `mailto`
+        mailtoLink = extractMailtoLink('mailto:' + arg);
+        urlsToOpen = urlsToOpen.concat(mailtoLink.urlsToOpen);
+        pathsToOpen = pathsToOpen.concat(mailtoLink.pathsToOpen);
+      } else {
+        pathsToOpen.push(arg);
+      }
     }
   }
 
@@ -192,6 +204,36 @@ const parseCommandLine = argv => {
     pathsToOpen,
   };
 };
+
+const extractMailtoLink = (mailtoLink) => {
+  console.log(mailtoLink)
+
+  // Handle links in the form mailto:test@example.com?attach=file:///path/to/file.txt
+  // This will handle links e.g. for nautilus-sendto and attach the attachments correctly.
+  // Attachments currently cannot be attached to mails with a recipient,
+  // so if a recipient and an attachment is given two mail windows are opened.
+  let mailCreated = false;
+
+  const urlsToOpen = [];
+  const pathsToOpen = [];
+
+  const mailtoUrl = new URL(mailtoLink);
+  mailtoUrl.searchParams.forEach((value, key) => {
+    if (key === "attach") {
+      // We need to strip the leading `file://` in order to detect the files
+      pathsToOpen.push(value.replace(/^file:\/\//, ""));
+      mailCreated = true;
+    }
+  })
+
+  // Check if another draft window should be opened if there is a recipient set
+  // Prevents duplicate draft window for links such as mailto:?attach=file:///path/to/file.txt
+  if (!mailCreated || (mailtoUrl.pathname !== '')) {
+    urlsToOpen.push(mailtoLink);
+  }
+
+  return { urlsToOpen, pathsToOpen }
+}
 
 /*
  * "Squirrel will spawn your app with command line flags on first run, updates,]
@@ -277,6 +319,23 @@ const start = () => {
   app.on('ready', () => {
     app.removeListener('open-file', onOpenFileBeforeReady);
     app.removeListener('open-url', onOpenUrlBeforeReady);
+
+    // Block remote JS execution in a second way in case our <meta> tag approach
+    // is compromised somehow https://www.electronjs.org/docs/tutorial/security
+    // This CSP string should match the one in app/static/index.html
+    require('electron').session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+      if (details.url.startsWith('devtools://')) {
+        return callback(details);
+      }
+      callback({
+        responseHeaders: {
+          ...details.responseHeaders,
+          'Content-Security-Policy': [
+            "default-src * mailspring:; script-src 'self' 'unsafe-inline' chrome-extension://react-developer-tools; style-src * 'unsafe-inline' mailspring:; img-src * data: mailspring: file:;",
+          ],
+        },
+      });
+    });
 
     // eslint-disable-next-line
     const Application = require(path.join(options.resourcePath, 'src', 'browser', 'application'))
